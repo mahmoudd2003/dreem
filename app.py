@@ -22,6 +22,7 @@ def load_text(path):
 def load_json(path):
     return json.loads(load_text(path))
 
+# تحميل القواعد والقوالب
 RULES = load_json("rules.json")
 PROMPTS = load_json("prompts.json")
 
@@ -91,8 +92,10 @@ def safe_json_loads(s):
     except Exception:
         m = re.search(r"(\{.*\})", s, flags=re.DOTALL)
         if m:
-            try: return json.loads(m.group(1))
-            except Exception: return {"raw": s, "error": "failed_json_parse"}
+            try: 
+                return json.loads(m.group(1))
+            except Exception: 
+                return {"raw": s, "error": "failed_json_parse"}
         return {"raw": s, "error": "no_json_found"}
 
 # --- Safe placeholder replacement (avoids .format conflicts with JSON braces) ---
@@ -102,10 +105,9 @@ def fill(template: str, mapping: dict) -> str:
         out = out.replace("{"+k+"}", v)
     return out
 
+# ===== LLM layers =====
 def llm_diagnostic(article, competitors, focus, lsi_list):
     comp_block = "\n\n".join([f"[المنافس {i+1}]\n{c}" for i, c in enumerate(competitors)])
-    if "diagnostic" not in PROMPTS:
-        raise KeyError("المفتاح 'diagnostic' غير موجود في prompts.json")
     prompt = fill(PROMPTS["diagnostic"], {
         "ARTICLE": article,
         "COMPETITORS": comp_block,
@@ -122,8 +124,6 @@ def llm_rewrite(article, competitors, focus, lsi_list, length_choice):
         "متوسط (1000-1300 كلمة)": "حوالي 1200 كلمة",
         "طويل (1500-2000 كلمة)": "حوالي 1700 كلمة"
     }[length_choice]
-    if "rewriter" not in PROMPTS:
-        raise KeyError("المفتاح 'rewriter' غير موجود في prompts.json")
     prompt = fill(PROMPTS["rewriter"], {
         "ARTICLE": article,
         "COMPETITORS": comp_block,
@@ -134,19 +134,37 @@ def llm_rewrite(article, competitors, focus, lsi_list, length_choice):
     return chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.6)
 
 def llm_apply_fixes(text, fix_plan_json):
-    if "fixer" not in PROMPTS:
-        raise KeyError("المفتاح 'fixer' غير موجود في prompts.json")
-    prompt = fill(PROMPTS["fixer"], {
+    # Fallback إذا لم يوجد المفتاح "fixer" داخل prompts.json
+    fixer_tmpl = PROMPTS.get("fixer") or (
+        "سيتم تزويدك بنص مقال وبعض الإصلاحات المطلوبة (Fix Plan). "
+        "طبّق الإصلاحات فقط على المواضع اللازمة وأعد النص المعدّل كاملاً."
+        "\n\n--- النص الحالي ---\n{TEXT}\n\n--- خطة الإصلاح ---\n{FIX_PLAN_JSON}\n"
+    )
+    prompt = fill(fixer_tmpl, {
         "TEXT": text,
         "FIX_PLAN_JSON": json.dumps(fix_plan_json, ensure_ascii=False, indent=2)
     })
     return chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.5)
 
 def llm_meta_faq(focus):
-    if "meta_faq" not in PROMPTS:
-        raise KeyError("المفتاح 'meta_faq' غير موجود في prompts.json")
-    prompt = fill(PROMPTS["meta_faq"], {"FOCUS": focus})
+    # Fallback prompt إن لم يوجد "meta_faq" أو كان لا يُرجع مصادر
+    meta_tmpl = PROMPTS.get("meta_faq") or (
+        'أنشئ JSON يحوي Title (≤65) و Description (≤160) و4 أسئلة FAQ قصيرة وإجاباتها، '
+        'وأيضاً مصفوفة "sources" (3-5 مصادر بأسماء وروابط عندما تتوفر) للكلمة "{FOCUS}": '
+        '{ "title":"...", "description":"...", "faq":[{"q":"...","a":"..."}], "sources":["...","..."] }'
+    )
+    prompt = fill(meta_tmpl, {"FOCUS": focus})
     out = chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.4)
+    data = safe_json_loads(out)
+    return data
+
+def llm_sources_from_scratch(focus):
+    # مولّد مصادر بديل يطلب أسماء واضحة وروابط موثوقة إن وجدت
+    prompt = (
+        "اقترح 3-5 مصادر موثوقة لمقال عن '{FOCUS}' بصيغة JSON: "
+        '{ "sources": ["اسم المصدر - رابط أو ملاحظة الوصول", "..."] }'
+    ).replace("{FOCUS}", focus)
+    out = chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.3)
     return safe_json_loads(out)
 
 def apply_anchors(article, anchors_df):
@@ -239,16 +257,35 @@ if "rewritten" in st.session_state:
         st.subheader("📄 المقال بعد تطبيق الإصلاحات")
         st.write(st.session_state["final_text"])
 
-# Meta / FAQ
+# Meta / FAQ / Sources
 if st.button("🧷 توليد Meta & FAQ & مصادر"):
     if not focus_kw:
         st.warning("أدخل الكلمة المفتاحية أولاً.")
     else:
         with st.spinner("جاري التوليد..."):
             meta = llm_meta_faq(focus_kw)
-    st.session_state["meta_block"] = meta
+    # إن لم تتوفر مصادر داخل meta_faq، جرّب التشخيص أو ولّد من الصفر:
+    sources = []
+    if isinstance(meta, dict):
+        sources = meta.get("sources", []) or []
+    if not sources:
+        diag = st.session_state.get("diagnostic", {})
+        if isinstance(diag, dict):
+            meta_diag = diag.get("meta", {})
+            sources = meta_diag.get("sources", []) or []
+    if not sources:
+        with st.spinner("جاري اقتراح مصادر موثوقة..."):
+            srcs = llm_sources_from_scratch(focus_kw)
+            if isinstance(srcs, dict):
+                sources = srcs.get("sources", []) or []
+
+    # عرض الناتج
+    st.session_state["meta_block"] = {"title": meta.get("title") if isinstance(meta, dict) else None,
+                                      "description": meta.get("description") if isinstance(meta, dict) else None,
+                                      "faq": meta.get("faq") if isinstance(meta, dict) else [],
+                                      "sources": sources}
     st.subheader("📌 SEO Outputs")
-    st.json(meta)
+    st.json(st.session_state["meta_block"])
 
 # Anchors
 if "final_text" in st.session_state or "rewritten" in st.session_state:
