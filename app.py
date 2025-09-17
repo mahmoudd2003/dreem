@@ -95,12 +95,25 @@ def safe_json_loads(s):
             except Exception: return {"raw": s, "error": "failed_json_parse"}
         return {"raw": s, "error": "no_json_found"}
 
+# --- Safe placeholder replacement (avoids .format conflicts with JSON braces) ---
+def fill(template: str, mapping: dict) -> str:
+    out = template
+    for k, v in mapping.items():
+        out = out.replace("{"+k+"}", v)
+    return out
+
 def llm_diagnostic(article, competitors, focus, lsi_list):
     comp_block = "\n\n".join([f"[المنافس {i+1}]\n{c}" for i, c in enumerate(competitors)])
-    prompt = PROMPTS["diagnostic"].format(ARTICLE=article, COMPETITORS=comp_block, FOCUS=focus, LSI=", ".join(lsi_list))
+    if "diagnostic" not in PROMPTS:
+        raise KeyError("المفتاح 'diagnostic' غير موجود في prompts.json")
+    prompt = fill(PROMPTS["diagnostic"], {
+        "ARTICLE": article,
+        "COMPETITORS": comp_block,
+        "FOCUS": focus,
+        "LSI": ", ".join(lsi_list)
+    })
     out = chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.2)
-    data = safe_json_loads(out)
-    return data
+    return safe_json_loads(out)
 
 def llm_rewrite(article, competitors, focus, lsi_list, length_choice):
     comp_block = "\n\n".join([f"[المنافس {i+1}]\n{c}" for i, c in enumerate(competitors)])
@@ -109,15 +122,30 @@ def llm_rewrite(article, competitors, focus, lsi_list, length_choice):
         "متوسط (1000-1300 كلمة)": "حوالي 1200 كلمة",
         "طويل (1500-2000 كلمة)": "حوالي 1700 كلمة"
     }[length_choice]
-    prompt = PROMPTS["rewriter"].format(ARTICLE=article, COMPETITORS=comp_block, FOCUS=focus, LSI=", ".join(lsi_list), LENGTH_DESC=length_desc)
+    if "rewriter" not in PROMPTS:
+        raise KeyError("المفتاح 'rewriter' غير موجود في prompts.json")
+    prompt = fill(PROMPTS["rewriter"], {
+        "ARTICLE": article,
+        "COMPETITORS": comp_block,
+        "FOCUS": focus,
+        "LSI": ", ".join(lsi_list),
+        "LENGTH_DESC": length_desc
+    })
     return chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.6)
 
 def llm_apply_fixes(text, fix_plan_json):
-    prompt = PROMPTS["fixer"].format(TEXT=text, FIX_PLAN_JSON=json.dumps(fix_plan_json, ensure_ascii=False, indent=2))
+    if "fixer" not in PROMPTS:
+        raise KeyError("المفتاح 'fixer' غير موجود في prompts.json")
+    prompt = fill(PROMPTS["fixer"], {
+        "TEXT": text,
+        "FIX_PLAN_JSON": json.dumps(fix_plan_json, ensure_ascii=False, indent=2)
+    })
     return chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.5)
 
 def llm_meta_faq(focus):
-    prompt = PROMPTS["meta_faq"].format(FOCUS=focus)
+    if "meta_faq" not in PROMPTS:
+        raise KeyError("المفتاح 'meta_faq' غير موجود في prompts.json")
+    prompt = fill(PROMPTS["meta_faq"], {"FOCUS": focus})
     out = chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.4)
     return safe_json_loads(out)
 
