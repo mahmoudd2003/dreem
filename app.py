@@ -1,180 +1,249 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import openai
 import pandas as pd
 from docx import Document
-import json
+import json, re, math
 
-# ----------------- الإعدادات العامة -----------------
-st.set_page_config(page_title="Dream SEO Enhancer", page_icon="🌙", layout="wide")
-openai.api_key = st.secrets["OPENAI_API_KEY"]
+st.set_page_config(page_title="Dream Article Diagnostic & SEO Enhancer", page_icon="🌙", layout="wide")
 
-# ----------------- دوال مساعدة -----------------
+# ===== CONFIG =====
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+if not OPENAI_API_KEY:
+    st.warning("⚠️ أضف OPENAI_API_KEY في Secrets قبل التشغيل.")
+openai.api_key = OPENAI_API_KEY
+
+@st.cache_data
+def load_text(path):
+    return open(path, "r", encoding="utf-8").read()
+
+def load_json(path):
+    return json.loads(load_text(path))
+
+RULES = load_json("rules.json")
+PROMPTS = load_json("prompts.json")
+
+# ===== Helpers =====
+def chat(model, messages, temperature=0.4):
+    resp = openai.chat.completions.create(model=model, messages=messages, temperature=temperature)
+    return resp.choices[0].message.content
+
 def fetch_competitor_text(url):
-    """جلب نص من رابط منافس"""
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-        return "\n".join(paragraphs[:40])
+        core = "\n".join([p for p in paragraphs if len(p.split()) > 4])
+        return core[:15000]
     except Exception as e:
         return f"خطأ في جلب النص: {e}"
 
-def analyze_article(article, competitors, keyword, related_keywords):
-    """تحليل المقال الأصلي والمنافسين"""
-    competitor_texts = "\n\n".join([f"[المنافس {i+1}]\n{txt}" for i, txt in enumerate(competitors)])
-    prompt = f"""
-أنت خبير SEO في مقالات تفسير الأحلام.
-المطلوب:
-1- حلّل المقال التالي واكشف مشاكله حسب Google Helpful Content و E-E-A-T.
-2- حلّل النصوص المأخوذة من المنافسين.
-3- استخرج لماذا يتصدرون في جوجل (نقاط القوة).
-4- استخرج أهم مشاكلهم.
-5- اقترح كيف يمكن تحسين المقال الأصلي.
-6- افحص كثافة الكلمة المفتاحية "{keyword}" وهل استخدمت بشكل صحيح.
-7- راقب الكلمات المرتبطة: {", ".join(related_keywords)}.
+def count_words(txt):
+    return len(re.findall(r"\w+", txt, flags=re.UNICODE))
 
---- المقال الأصلي ---
-{article}
+def keyword_density(text, keyword):
+    if not keyword:
+        return 0.0, 0, count_words(text)
+    wc = count_words(text)
+    k_count = len(re.findall(re.escape(keyword), text, flags=re.IGNORECASE))
+    density = (k_count / max(wc,1)) * 100.0
+    return round(density,2), k_count, wc
 
---- المنافسون ---
-{competitor_texts}
-"""
-    response = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.4,
-    )
-    return response.choices[0].message.content
+def rule_engine_precheck(text, focus, lsi_list, length_choice):
+    res = {"checks": {}, "metrics": {}}
+    wc = count_words(text)
+    target = RULES["length_map"][length_choice]
+    lo, hi = math.floor(target*0.9), math.ceil(target*1.1)
+    res["metrics"]["word_count"] = wc
+    res["metrics"]["target_range"] = [lo, hi]
+    res["checks"]["length_ok"] = (lo <= wc <= hi)
 
-def rewrite_article(article, competitors, keyword, related_keywords, length_choice):
-    """إعادة كتابة المقال"""
-    competitor_texts = "\n\n".join([f"[المنافس {i+1}]\n{txt}" for i, txt in enumerate(competitors)])
+    dens, kcount, _ = keyword_density(text, focus)
+    res["metrics"]["focus_density_pct"] = dens
+    res["metrics"]["focus_count"] = kcount
+    lo_d, hi_d = RULES["focus_density_min_pct"], RULES["focus_density_max_pct"]
+    res["checks"]["focus_density_ok"] = (dens >= lo_d and dens <= hi_d)
 
-    length_map = {
+    lsi_report, lsi_ok = {}, True
+    for k in lsi_list:
+        c = len(re.findall(re.escape(k), text, flags=re.IGNORECASE))
+        lsi_report[k] = c
+        if c > RULES["lsi_max_occurrence"]:
+            lsi_ok = False
+    res["metrics"]["lsi_counts"] = lsi_report
+    res["checks"]["lsi_ok"] = lsi_ok
+
+    banned_hits = []
+    for pat in RULES["banned_regex"]:
+        if re.search(pat, text):
+            banned_hits.append(pat)
+    res["metrics"]["banned_hits"] = banned_hits
+    res["checks"]["no_banned"] = (len(banned_hits) == 0)
+
+    return res
+
+def safe_json_loads(s):
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"(\{.*\})", s, flags=re.DOTALL)
+        if m:
+            try: return json.loads(m.group(1))
+            except Exception: return {"raw": s, "error": "failed_json_parse"}
+        return {"raw": s, "error": "no_json_found"}
+
+def llm_diagnostic(article, competitors, focus, lsi_list):
+    comp_block = "\n\n".join([f"[المنافس {i+1}]\n{c}" for i, c in enumerate(competitors)])
+    prompt = PROMPTS["diagnostic"].format(ARTICLE=article, COMPETITORS=comp_block, FOCUS=focus, LSI=", ".join(lsi_list))
+    out = chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.2)
+    data = safe_json_loads(out)
+    return data
+
+def llm_rewrite(article, competitors, focus, lsi_list, length_choice):
+    comp_block = "\n\n".join([f"[المنافس {i+1}]\n{c}" for i, c in enumerate(competitors)])
+    length_desc = {
         "قصير (700-900 كلمة)": "حوالي 800 كلمة",
         "متوسط (1000-1300 كلمة)": "حوالي 1200 كلمة",
         "طويل (1500-2000 كلمة)": "حوالي 1700 كلمة"
-    }
+    }[length_choice]
+    prompt = PROMPTS["rewriter"].format(ARTICLE=article, COMPETITORS=comp_block, FOCUS=focus, LSI=", ".join(lsi_list), LENGTH_DESC=length_desc)
+    return chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.6)
 
-    prompt = f"""
-أعد كتابة المقال التالي عن تفسير الأحلام بحيث:
-- يستخدم الكلمة المفتاحية الرئيسية: "{keyword}" 3-5 مرات بشكل طبيعي.
-- يدمج الكلمات المرتبطة: {", ".join(related_keywords)} في النص بشكل منطقي.
-- يكون الطول {length_map[length_choice]}.
-- يحتوي على خبرة مباشرة ومنهجية واضحة.
-- يضيف أمثلة واقعية وحسّية.
-- يقارن بين مدارس التفسير (ابن سيرين، النابلسي، ابن شاهين...).
-- يبرز الشفافية (هذا اجتهاد لا حتمي).
-- يقدم نصائح عملية للقارئ.
-- يتفادى التكرار والحشو.
-- منظم بعناوين فرعية واضحة.
-- يحتوي على فقرة ختامية تحفيزية.
-- يقترح قسم FAQ في النهاية.
-- يقترح قسم "📚 المصادر" في النهاية.
+def llm_apply_fixes(text, fix_plan_json):
+    prompt = PROMPTS["fixer"].format(TEXT=text, FIX_PLAN_JSON=json.dumps(fix_plan_json, ensure_ascii=False, indent=2))
+    return chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.5)
 
---- المقال الأصلي ---
-{article}
+def llm_meta_faq(focus):
+    prompt = PROMPTS["meta_faq"].format(FOCUS=focus)
+    out = chat(PROMPTS["model"], [{"role":"user","content":prompt}], temperature=0.4)
+    return safe_json_loads(out)
 
---- المنافسون (للاستفادة من نقاط قوتهم) ---
-{competitor_texts}
-"""
-    response = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.6,
-    )
-    return response.choices[0].message.content
+def apply_anchors(article, anchors_df):
+    new_text = article
+    applied, skipped = [], []
+    for _, row in anchors_df.iterrows():
+        phrase, link = (row.get("النص") or "").strip(), (row.get("الرابط") or "").strip()
+        if not phrase or not link: 
+            continue
+        if phrase in new_text:
+            new_text = new_text.replace(phrase, f"[{phrase}]({link})", 1)
+            applied.append(phrase)
+        else:
+            words = phrase.split()
+            window = " ".join(words[:6]) if len(words) >= 6 else phrase
+            if window in new_text:
+                new_text = new_text.replace(window, f"[{window}]({link})", 1)
+                applied.append(window + " (جزئي)")
+            else:
+                skipped.append(phrase)
+    return new_text, applied, skipped
 
-def apply_internal_links(article, links_df):
-    """إضافة روابط داخلية على جمل أو عبارات"""
-    new_article = article
-    for _, row in links_df.iterrows():
-        phrase, link = row["النص"], row["الرابط"]
-        if phrase and link:
-            new_article = new_article.replace(phrase, f"[{phrase}]({link})", 1)
-    return new_article
-
-def export_docx(text, filename="article.docx"):
+def export_docx(text):
     doc = Document()
     for line in text.split("\n"):
         doc.add_paragraph(line)
-    doc.save(filename)
-    return filename
+    doc.save("article.docx")
+    with open("article.docx", "rb") as f:
+        return f.read()
 
-# ----------------- واجهة Streamlit -----------------
-st.title("🌙 نظام تحسين مقالات تفسير الأحلام (SEO + E-E-A-T)")
+# ===== UI =====
+st.title("🌙 Dream Article Diagnostic & SEO Enhancer (LLM-Guided)")
 
-with st.expander("📥 إدخال بيانات المقال"):
-    article_input = st.text_area("الصق المقال هنا:", height=300)
-    keyword = st.text_input("🔑 الكلمة المفتاحية الرئيسية")
-    related_keywords = st.text_area("📌 الكلمات المرتبطة (افصل بينها بفاصلة)")
-    related_list = [k.strip() for k in related_keywords.split(",") if k.strip()]
+with st.expander("📥 إدخال المقال والمنافسين", expanded=True):
+    article_input = st.text_area("الصق المقال هنا:", height=260, key="article_input")
+    focus_kw = st.text_input("🔑 الكلمة المفتاحية الرئيسية (Focus Keyword)", key="focus_kw")
+    lsi_raw = st.text_area("📌 الكلمات المرتبطة (افصل بينها بفاصلة)", key="lsi_raw")
+    lsi_list = [k.strip() for k in lsi_raw.split(",") if k.strip()]
+    length_choice = st.selectbox("📏 طول المقال المطلوب", ["قصير (700-900 كلمة)","متوسط (1000-1300 كلمة)","طويل (1500-2000 كلمة)"])
 
-    length_choice = st.selectbox(
-        "📏 اختر طول المقال المطلوب",
-        ["قصير (700-900 كلمة)", "متوسط (1000-1300 كلمة)", "طويل (1500-2000 كلمة)"]
-    )
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        comp1 = st.text_input("رابط المنافس 1")
-    with col2:
-        comp2 = st.text_input("رابط المنافس 2")
-    with col3:
-        comp3 = st.text_input("رابط المنافس 3")
+    c1,c2,c3 = st.columns(3)
+    with c1: comp1 = st.text_input("رابط المنافس 1", key="comp1")
+    with c2: comp2 = st.text_input("رابط المنافس 2", key="comp2")
+    with c3: comp3 = st.text_input("رابط المنافس 3", key="comp3")
 
 competitors_texts = []
-if comp1: competitors_texts.append(fetch_competitor_text(comp1))
-if comp2: competitors_texts.append(fetch_competitor_text(comp2))
-if comp3: competitors_texts.append(fetch_competitor_text(comp3))
+for u in [st.session_state.get("comp1"), st.session_state.get("comp2"), st.session_state.get("comp3")]:
+    if u: competitors_texts.append(fetch_competitor_text(u))
 
-# ---- التحليل ----
-if st.button("🔎 تحليل المقال والمنافسين"):
-    if article_input and keyword:
-        with st.spinner("جاري التحليل..."):
-            report = analyze_article(article_input, competitors_texts, keyword, related_list)
-        st.subheader("📊 تقرير التحليل")
-        st.write(report)
+colA, colB = st.columns(2)
+with colA:
+    if st.button("🔎 تشخيص مرشد (LLM Diagnostic)"):
+        if not article_input or not focus_kw:
+            st.warning("أدخل المقال والكلمة المفتاحية أولاً.")
+        else:
+            with st.spinner("جاري التشخيص..."):
+                diag = llm_diagnostic(article_input, competitors_texts, focus_kw, lsi_list)
+            st.session_state["diagnostic"] = diag
+            st.subheader("📊 نتائج التشخيص")
+            st.json(diag)
+
+with colB:
+    if st.button("✍️ إعادة كتابة محسّنة"):
+        if not article_input or not focus_kw:
+            st.warning("أدخل المقال والكلمة المفتاحية أولاً.")
+        else:
+            with st.spinner("جاري إعادة الكتابة..."):
+                rewritten = llm_rewrite(article_input, competitors_texts, focus_kw, lsi_list, length_choice)
+            st.session_state["rewritten"] = rewritten
+            st.subheader("📝 المقال بعد التحسين (مسودة أولى)")
+            st.write(rewritten)
+
+# Pre-check & Post-fix
+if "rewritten" in st.session_state:
+    st.markdown("---")
+    st.subheader("🧪 فحوصات الجودة (Rule Engine)")
+    pre = rule_engine_precheck(st.session_state["rewritten"], focus_kw, lsi_list, length_choice)
+    st.json(pre)
+
+    if st.button("🧰 تطبيق خطة الإصلاح (إن وُجدت)"):
+        diag = st.session_state.get("diagnostic", {})
+        fix_plan = {"fixes": diag.get("fixes", [])} if isinstance(diag, dict) else {"fixes": []}
+        if not fix_plan["fixes"]:
+            st.info("لا توجد Fixes من التشخيص. سيتم عرض النص كما هو.")
+            st.session_state["final_text"] = st.session_state["rewritten"]
+        else:
+            with st.spinner("تطبيق الإصلاحات على الفقرات المحددة..."):
+                fixed = llm_apply_fixes(st.session_state["rewritten"], fix_plan)
+            st.session_state["final_text"] = fixed
+        st.subheader("📄 المقال بعد تطبيق الإصلاحات")
+        st.write(st.session_state["final_text"])
+
+# Meta / FAQ
+if st.button("🧷 توليد Meta & FAQ & مصادر"):
+    if not focus_kw:
+        st.warning("أدخل الكلمة المفتاحية أولاً.")
     else:
-        st.warning("الرجاء إدخال المقال والكلمة المفتاحية.")
+        with st.spinner("جاري التوليد..."):
+            meta = llm_meta_faq(focus_kw)
+    st.session_state["meta_block"] = meta
+    st.subheader("📌 SEO Outputs")
+    st.json(meta)
 
-# ---- إعادة الكتابة ----
-if st.button("✍️ إعادة كتابة المقال"):
-    if article_input and keyword:
-        with st.spinner("جاري إعادة الكتابة..."):
-            rewritten = rewrite_article(article_input, competitors_texts, keyword, related_list, length_choice)
-        st.subheader("📝 المقال بعد التحسين")
-        st.session_state["rewritten_article"] = rewritten
-        st.write(rewritten)
-
-        # عداد الكلمات
-        word_count = len(rewritten.split())
-        st.info(f"عدد كلمات المقال: {word_count}")
-    else:
-        st.warning("الرجاء إدخال المقال والكلمة المفتاحية.")
-
-# ---- الروابط الداخلية ----
-if "rewritten_article" in st.session_state:
-    st.subheader("🔗 أضف الروابط الداخلية (Anchors)")
-    links_df = st.data_editor(
-        pd.DataFrame([{"النص": "", "الرابط": ""}]),
-        num_rows="dynamic",
-        use_container_width=True
-    )
+# Anchors
+if "final_text" in st.session_state or "rewritten" in st.session_state:
+    st.markdown("---")
+    st.subheader("🔗 الروابط الداخلية (Anchors على جُمل)")
+    anchors_df = st.data_editor(pd.DataFrame([{"النص":"", "الرابط":""}]), num_rows="dynamic", use_container_width=True, key="anchors_df")
     if st.button("تطبيق الروابط الداخلية"):
-        updated_article = apply_internal_links(st.session_state["rewritten_article"], links_df)
+        base_text = st.session_state.get("final_text") or st.session_state.get("rewritten", "")
+        updated, applied, skipped = apply_anchors(base_text, anchors_df)
+        st.session_state["final_with_anchors"] = updated
+        st.success(f"تم تطبيق {len(applied)} رابط. المتعذر: {len(skipped)}")
+        if skipped: st.write("تعذر تطبيق على:", skipped)
         st.subheader("📄 المقال النهائي مع الروابط الداخلية")
-        st.write(updated_article)
-        st.session_state["final_article"] = updated_article
+        st.write(updated)
 
-# ---- التصدير ----
-if "final_article" in st.session_state:
-    st.subheader("💾 تنزيل المقال")
-    final_text = st.session_state["final_article"]
-
-    st.download_button("تحميل DOCX", data=final_text.encode("utf-8"), file_name="article.docx")
-    st.download_button("تحميل Markdown", data=final_text.encode("utf-8"), file_name="article.md")
-    json_data = json.dumps({"article": final_text}, ensure_ascii=False, indent=2)
-    st.download_button("تحميل JSON", data=json_data.encode("utf-8"), file_name="article.json")
+# Downloads
+final_output = st.session_state.get("final_with_anchors") or st.session_state.get("final_text") or st.session_state.get("rewritten")
+if final_output:
+    st.markdown("---")
+    st.subheader("💾 تنزيل")
+    md_bytes = final_output.encode("utf-8")
+    st.download_button("تحميل Markdown", data=md_bytes, file_name="article.md")
+    json_bytes = json.dumps({"article": final_output}, ensure_ascii=False, indent=2).encode("utf-8")
+    st.download_button("تحميل JSON", data=json_bytes, file_name="article.json")
+    docx_bytes = export_docx(final_output)
+    st.download_button("تحميل DOCX", data=docx_bytes, file_name="article.docx")
